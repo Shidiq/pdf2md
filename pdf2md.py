@@ -2,6 +2,7 @@
 """pdf2md - Convert PDF files to Markdown with image extraction."""
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -11,39 +12,47 @@ except ImportError:
     print("Error: PyMuPDF is required. Install it with: pip install pymupdf", file=sys.stderr)
     sys.exit(1)
 
+# Font name fragments (lowercase) that indicate a math/symbol font
+_MATH_FONT_FRAGMENTS = frozenset({
+    "cmmi", "cmsy", "cmex", "cmr", "msbm", "eufm",
+    "symbol", "mt extra", "cambria math", "asana math",
+    "stixmath", "stix", "latinmodern-math", "texgyre",
+})
 
-def extract_images(page: fitz.Page, page_num: int, images_dir: Path) -> list[dict]:
-    """Extract images from a PDF page and save them to disk."""
-    images_dir.mkdir(parents=True, exist_ok=True)
-    extracted = []
-
-    for img_index, img_ref in enumerate(page.get_images(full=True), start=1):
-        xref = img_ref[0]
-        doc = page.parent
-        base_image = doc.extract_image(xref)
-        if not base_image:
-            continue
-
-        ext = base_image["ext"]
-        image_data = base_image["image"]
-        filename = f"page{page_num}_img{img_index}.{ext}"
-        image_path = images_dir / filename
-
-        with open(image_path, "wb") as f:
-            f.write(image_data)
-
-        extracted.append({
-            "path": image_path,
-            "filename": filename,
-            "index": img_index,
-            "page": page_num,
-        })
-
-    return extracted
+# Unicode characters that strongly indicate math content
+_MATH_CHARS = frozenset(
+    "∫∑∏√∞±×÷≤≥≠≈→←↑↓∂∇∈∉⊂⊃∪∩⊆⊇⊕⊗"
+    "αβγδεζηθικλμνξπρστυφχψωΑΒΓΔΕΖΗΘΙΚΛΜΝΞΠΡΣΤΥΦΧΨΩ"
+    "∀∃∄∅∧∨¬⟹⟺ℝℂℕℤℚℏ°′″"
+)
 
 
-def get_heading_level(span_size: float, body_size: float) -> int | None:
-    """Determine markdown heading level based on font size ratio."""
+def _is_math_font(font_name: str) -> bool:
+    name = font_name.lower()
+    return any(f in name for f in _MATH_FONT_FRAGMENTS)
+
+
+def _math_ratio(text: str) -> float:
+    """Fraction of characters in text that are math/Greek symbols."""
+    if not text:
+        return 0.0
+    return sum(1 for c in text if c in _MATH_CHARS) / len(text)
+
+
+def _need_space(span_a: dict, span_b: dict) -> bool:
+    """Return True if a space should be inserted between two consecutive spans.
+
+    Uses the visual gap between their bounding boxes. A gap wider than
+    ~25% of the font size is treated as a word boundary.
+    """
+    # If either span already carries a boundary space, no extra space needed
+    if span_a["text"].endswith((" ", "\t")) or span_b["text"].startswith((" ", "\t")):
+        return False
+    gap = span_b["bbox"][0] - span_a["bbox"][2]
+    return gap > span_a["size"] * 0.25
+
+
+def _heading_level(span_size: float, body_size: float) -> int | None:
     ratio = span_size / body_size if body_size else 1.0
     if ratio >= 1.8:
         return 1
@@ -54,115 +63,203 @@ def get_heading_level(span_size: float, body_size: float) -> int | None:
     return None
 
 
+def _apply_formatting(text: str, span: dict, body_size: float) -> str:
+    """Wrap text with markdown formatting based on font properties."""
+    text = text.strip()
+    if not text:
+        return ""
+
+    # Math span → inline equation
+    if _is_math_font(span.get("font", "")) or _math_ratio(text) > 0.3:
+        return f"${text}$"
+
+    level = _heading_level(span["size"], body_size)
+    if level:
+        return f"{'#' * level} {text}"
+
+    flags = span["flags"]
+    bold = bool(flags & 16)
+    italic = bool(flags & 2)
+    if bold and italic:
+        return f"***{text}***"
+    if bold:
+        return f"**{text}**"
+    if italic:
+        return f"*{text}*"
+    return text
+
+
+def _build_line_text(spans: list[dict], body_size: float) -> str:
+    """Assemble a list of spans into a single line string.
+
+    Inserts spaces between spans where the visual gap suggests a word
+    boundary, preventing words from merging together.
+    """
+    parts: list[str] = []
+    prev_content_idx = -1  # index of last span that had real text
+
+    for i, span in enumerate(spans):
+        raw = span["text"]
+        if not raw:
+            continue
+
+        # Whitespace-only span: preserve it as a literal space
+        if not raw.strip():
+            parts.append(" ")
+            continue
+
+        # Check if we need to insert a space before this span
+        if prev_content_idx >= 0:
+            if _need_space(spans[prev_content_idx], span):
+                # Avoid double-spacing
+                if parts and not parts[-1].endswith(" "):
+                    parts.append(" ")
+
+        parts.append(_apply_formatting(raw, span, body_size))
+        prev_content_idx = i
+
+    return "".join(parts).strip()
+
+
+def _is_display_equation(line_text: str) -> bool:
+    """Heuristic: is this line a standalone display equation?
+
+    Criteria: already wrapped as $...$ OR more than 40% math characters
+    and short enough to be a formula (not prose).
+    """
+    stripped = line_text.strip()
+    # Already an inline math span promoted from a math font
+    if re.fullmatch(r"\$[^$]+\$", stripped):
+        return True
+    # High math-character density, not a long prose sentence
+    if _math_ratio(stripped) > 0.35 and len(stripped) < 300:
+        return True
+    return False
+
+
+def _promote_to_display(line_text: str) -> str:
+    """Rewrap an equation line as a display (block) equation."""
+    # Strip wrapping $...$ if present, then rewrap as $$...$$
+    inner = re.sub(r"^\$(.+)\$$", r"\1", line_text.strip())
+    return f"$$\n{inner}\n$$"
+
+
+def extract_images(page: fitz.Page, page_num: int, images_dir: Path) -> list[dict]:
+    """Extract images from a PDF page and save them to disk."""
+    images_dir.mkdir(parents=True, exist_ok=True)
+    extracted = []
+
+    for img_index, img_ref in enumerate(page.get_images(full=True), start=1):
+        xref = img_ref[0]
+        base_image = page.parent.extract_image(xref)
+        if not base_image:
+            continue
+
+        filename = f"page{page_num}_img{img_index}.{base_image['ext']}"
+        (images_dir / filename).write_bytes(base_image["image"])
+        extracted.append({"filename": filename, "index": img_index, "page": page_num})
+
+    return extracted
+
+
 def detect_body_font_size(page: fitz.Page) -> float:
-    """Find the most common font size on the page (body text size)."""
+    """Most common font size on the page, weighted by character count."""
     size_counts: dict[float, int] = {}
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-    for block in blocks:
+    for block in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]:
         if block["type"] != 0:
             continue
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 size = round(span["size"], 1)
                 size_counts[size] = size_counts.get(size, 0) + len(span["text"].strip())
-
-    if not size_counts:
-        return 12.0
-    return max(size_counts, key=size_counts.get)
+    return max(size_counts, key=size_counts.get) if size_counts else 12.0
 
 
-def page_to_markdown(page: fitz.Page, page_num: int, images: list[dict]) -> str:
-    """Convert a single PDF page to Markdown text."""
+def page_to_markdown(page: fitz.Page, images: list[dict]) -> str:
+    """Convert a single PDF page to a Markdown string."""
     body_size = detect_body_font_size(page)
-    lines: list[str] = []
-    prev_block_type = None
+    output: list[str] = []
+    prev_had_text = False
+    hyphen_carry = ""  # fragment from a line-break hyphenated word
 
-    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
-
-    for block in blocks:
-        # Image block placeholder — actual images appended at end of page section
-        if block["type"] == 1:
-            continue
-
+    for block in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]:
         if block["type"] != 0:
             continue
 
-        block_lines = block.get("lines", [])
-        block_text_parts: list[str] = []
+        block_lines: list[str] = []
 
-        for line in block_lines:
-            line_parts: list[str] = []
-            for span in line.get("spans", []):
-                text = span["text"]
-                if not text.strip():
-                    line_parts.append(text)
-                    continue
+        for line in block.get("lines", []):
+            spans = [s for s in line.get("spans", []) if s["text"]]
+            if not spans:
+                continue
 
-                size = span["size"]
-                flags = span["flags"]  # bit flags: bold=16, italic=2
-                bold = bool(flags & 16)
-                italic = bool(flags & 2)
+            line_text = _build_line_text(spans, body_size)
+            if not line_text:
+                continue
 
-                heading = get_heading_level(size, body_size)
-                if heading:
-                    text = f"{'#' * heading} {text.strip()}"
-                else:
-                    if bold and italic:
-                        text = f"***{text.strip()}***"
-                    elif bold:
-                        text = f"**{text.strip()}**"
-                    elif italic:
-                        text = f"*{text.strip()}*"
+            # Reattach hyphen-carry from previous line
+            if hyphen_carry:
+                line_text = hyphen_carry + line_text.lstrip()
+                hyphen_carry = ""
 
-                line_parts.append(text)
+            # Detect ASCII line-break hyphenation: word ends with "-" and next
+            # char (start of next line) is lowercase → word was split for wrapping.
+            if re.search(r"-$", line_text):
+                hyphen_carry = line_text.rstrip("-")
+                continue
 
-            line_text = "".join(line_parts).strip()
-            if line_text:
-                block_text_parts.append(line_text)
+            # Promote isolated equation lines to display math
+            if _is_display_equation(line_text):
+                block_lines.append(_promote_to_display(line_text))
+            else:
+                block_lines.append(line_text)
 
-        block_text = "\n".join(block_text_parts).strip()
-        if block_text:
-            if prev_block_type == "text":
-                lines.append("")
-            lines.append(block_text)
-            prev_block_type = "text"
+        # Flush any orphaned hyphen carry at block boundary
+        if hyphen_carry:
+            block_lines.append(hyphen_carry)
+            hyphen_carry = ""
 
-    # Append extracted images at the end of the page section
+        block_text = "\n".join(block_lines).strip()
+        if not block_text:
+            continue
+
+        if prev_had_text:
+            output.append("")
+        output.append(block_text)
+        prev_had_text = True
+
+    # Image citations
     for img in images:
-        lines.append("")
-        lines.append(f"![Figure {img['index']} (page {img['page']})]({img['filename']})")
+        output.append("")
+        output.append(f"![Figure {img['index']} (page {img['page']})]({img['filename']})")
 
-    return "\n".join(lines)
+    return "\n".join(output)
 
 
 def convert(pdf_path: Path, output_path: Path, images_dir_name: str = "images") -> None:
     """Convert a PDF file to Markdown."""
     doc = fitz.open(pdf_path)
     images_dir = output_path.parent / images_dir_name
-
-    md_sections: list[str] = []
+    sections: list[str] = []
 
     for page_num, page in enumerate(doc, start=1):
         images = extract_images(page, page_num, images_dir)
-
-        # Rewrite image paths to be relative to the markdown file
         for img in images:
             img["filename"] = f"{images_dir_name}/{img['filename']}"
 
-        page_md = page_to_markdown(page, page_num, images)
+        page_md = page_to_markdown(page, images)
         if page_md.strip():
-            md_sections.append(page_md)
+            sections.append(page_md)
 
     doc.close()
 
-    markdown = "\n\n---\n\n".join(md_sections)
-    output_path.write_text(markdown, encoding="utf-8")
-
+    output_path.write_text("\n\n---\n\n".join(sections), encoding="utf-8")
     print(f"Converted: {pdf_path} -> {output_path}")
+
     if images_dir.exists():
-        image_count = sum(1 for _ in images_dir.iterdir())
-        if image_count:
-            print(f"Extracted {image_count} image(s) to: {images_dir}/")
+        n = sum(1 for _ in images_dir.iterdir())
+        if n:
+            print(f"Extracted {n} image(s) to: {images_dir}/")
 
 
 def main() -> None:
@@ -186,7 +283,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    pdf_path: Path = args.pdf.resolve()
+    pdf_path = args.pdf.resolve()
     if not pdf_path.exists():
         print(f"Error: File not found: {pdf_path}", file=sys.stderr)
         sys.exit(1)
@@ -194,9 +291,8 @@ def main() -> None:
         print(f"Error: Input must be a PDF file: {pdf_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_path: Path = args.output if args.output else Path.cwd() / pdf_path.with_suffix(".md").name
-
-    convert(pdf_path, output_path.resolve(), images_dir_name=args.images_dir)
+    output_path = (args.output or Path.cwd() / pdf_path.with_suffix(".md").name).resolve()
+    convert(pdf_path, output_path, images_dir_name=args.images_dir)
 
 
 if __name__ == "__main__":
