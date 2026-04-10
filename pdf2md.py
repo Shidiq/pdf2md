@@ -7,17 +7,33 @@ import sys
 from pathlib import Path
 
 try:
-    import fitz  # PyMuPDF
+    import fitz  # type: ignore # PyMuPDF
 except ImportError:
-    print("Error: PyMuPDF is required. Install it with: pip install pymupdf", file=sys.stderr)
+    print(
+        "Error: PyMuPDF is required. Install it with: pip install pymupdf",
+        file=sys.stderr,
+    )
     sys.exit(1)
 
 # Font name fragments (lowercase) that indicate a math/symbol font
-_MATH_FONT_FRAGMENTS = frozenset({
-    "cmmi", "cmsy", "cmex", "cmr", "msbm", "eufm",
-    "symbol", "mt extra", "cambria math", "asana math",
-    "stixmath", "stix", "latinmodern-math", "texgyre",
-})
+_MATH_FONT_FRAGMENTS = frozenset(
+    {
+        "cmmi",
+        "cmsy",
+        "cmex",
+        "cmr",
+        "msbm",
+        "eufm",
+        "symbol",
+        "mt extra",
+        "cambria math",
+        "asana math",
+        "stixmath",
+        "stix",
+        "latinmodern-math",
+        "texgyre",
+    }
+)
 
 # Unicode characters that strongly indicate math content
 _MATH_CHARS = frozenset(
@@ -144,6 +160,43 @@ def _promote_to_display(line_text: str) -> str:
     return f"$$\n{inner}\n$$"
 
 
+def extract_annotations(page: fitz.Page, page_num: int) -> list[dict]:
+    """Extract annotations (comments, highlights, notes) from a PDF page."""
+    results = []
+    for annot in page.annots():
+        info = annot.info
+        kind_code, kind_name = annot.type  # e.g. (1, 'Text'), (8, 'Highlight')
+
+        content = info.get("content", "").strip()
+        author = info.get("title", "").strip()  # PyMuPDF stores author in 'title'
+        subject = info.get("subject", "").strip()
+        creation = info.get("creationDate", "").strip()
+
+        # For highlight/underline/squiggly/strikeout: get the highlighted text
+        highlighted_text = ""
+        if kind_code in (8, 9, 10, 11):  # Highlight, Underline, Squiggly, StrikeOut
+            try:
+                highlighted_text = page.get_textbox(annot.rect).strip()
+            except Exception:
+                pass
+
+        if not content and not highlighted_text:
+            continue
+
+        results.append(
+            {
+                "page": page_num,
+                "type": kind_name,
+                "author": author,
+                "date": creation,
+                "subject": subject,
+                "content": content,
+                "highlighted_text": highlighted_text,
+            }
+        )
+    return results
+
+
 def extract_images(page: fitz.Page, page_num: int, images_dir: Path) -> list[dict]:
     """Extract images from a PDF page and save them to disk."""
     images_dir.mkdir(parents=True, exist_ok=True)
@@ -175,7 +228,23 @@ def detect_body_font_size(page: fitz.Page) -> float:
     return max(size_counts, key=size_counts.get) if size_counts else 12.0
 
 
-def page_to_markdown(page: fitz.Page, images: list[dict]) -> str:
+def _format_annotation(annot: dict) -> str:
+    """Render a single annotation as a Markdown blockquote."""
+    kind = annot["type"]
+    author = f"**{annot['author']}**" if annot["author"] else ""
+    date = f" _{annot['date']}_" if annot["date"] else ""
+    meta = f"{author}{date}".strip()
+    header = f"> [{kind}]{' — ' + meta if meta else ''}"
+
+    lines = [header]
+    if annot["highlighted_text"]:
+        lines.append(f"> > *\"{annot['highlighted_text']}\"*")
+    if annot["content"]:
+        lines.append(f"> {annot['content']}")
+    return "\n".join(lines)
+
+
+def page_to_markdown(page: fitz.Page, images: list[dict], annotations: list[dict] | None = None) -> str:
     """Convert a single PDF page to a Markdown string."""
     body_size = detect_body_font_size(page)
     output: list[str] = []
@@ -231,35 +300,61 @@ def page_to_markdown(page: fitz.Page, images: list[dict]) -> str:
     # Image citations
     for img in images:
         output.append("")
-        output.append(f"![Figure {img['index']} (page {img['page']})]({img['filename']})")
+        output.append(
+            f"![Figure {img['index']} (page {img['page']})]({img['filename']})"
+        )
+
+    # Annotations / comments
+    if annotations:
+        output.append("")
+        output.append("**Comments & Annotations:**")
+        for annot in annotations:
+            output.append("")
+            output.append(_format_annotation(annot))
 
     return "\n".join(output)
 
 
-def convert(pdf_path: Path, output_path: Path, images_dir_name: str = "images") -> None:
-    """Convert a PDF file to Markdown."""
+def convert(
+    pdf_path: Path,
+    output_path: Path,
+    images_dir_name: str = "images",
+    extract_comments: bool = True,
+) -> dict:
+    """Convert a PDF file to Markdown.
+
+    Returns a summary dict with keys: output_path, images_count, annotation_count.
+    """
     doc = fitz.open(pdf_path)
     images_dir = output_path.parent / images_dir_name
     sections: list[str] = []
+    total_annotations = 0
 
     for page_num, page in enumerate(doc, start=1):
         images = extract_images(page, page_num, images_dir)
         for img in images:
             img["filename"] = f"{images_dir_name}/{img['filename']}"
 
-        page_md = page_to_markdown(page, images)
+        annotations = extract_annotations(page, page_num) if extract_comments else []
+        total_annotations += len(annotations)
+
+        page_md = page_to_markdown(page, images, annotations)
         if page_md.strip():
             sections.append(page_md)
 
     doc.close()
 
     output_path.write_text("\n\n---\n\n".join(sections), encoding="utf-8")
-    print(f"Converted: {pdf_path} -> {output_path}")
 
+    images_count = 0
     if images_dir.exists():
-        n = sum(1 for _ in images_dir.iterdir())
-        if n:
-            print(f"Extracted {n} image(s) to: {images_dir}/")
+        images_count = sum(1 for _ in images_dir.iterdir())
+
+    return {
+        "output_path": output_path,
+        "images_count": images_count,
+        "annotation_count": total_annotations,
+    }
 
 
 def main() -> None:
@@ -269,7 +364,8 @@ def main() -> None:
     )
     parser.add_argument("pdf", type=Path, help="Path to the input PDF file")
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
         help="Output .md file path (default: same name as PDF in current directory)",
@@ -291,8 +387,15 @@ def main() -> None:
         print(f"Error: Input must be a PDF file: {pdf_path}", file=sys.stderr)
         sys.exit(1)
 
-    output_path = (args.output or Path.cwd() / pdf_path.with_suffix(".md").name).resolve()
-    convert(pdf_path, output_path, images_dir_name=args.images_dir)
+    output_path = (
+        args.output or Path.cwd() / pdf_path.with_suffix(".md").name
+    ).resolve()
+    result = convert(pdf_path, output_path, images_dir_name=args.images_dir)
+    print(f"Converted: {pdf_path} -> {result['output_path']}")
+    if result["images_count"]:
+        print(f"Extracted {result['images_count']} image(s)")
+    if result["annotation_count"]:
+        print(f"Extracted {result['annotation_count']} annotation(s)/comment(s)")
 
 
 if __name__ == "__main__":

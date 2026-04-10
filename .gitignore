@@ -68,3 +68,6 @@ images/
 *.md.bak
 output/
 report.pdf
+
+# Claude Code
+.claude/
