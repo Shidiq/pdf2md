@@ -1,6 +1,8 @@
 # pdf2md
 
-A simple CLI tool to convert PDF files to Markdown (`.md`), with automatic image extraction and inline citation.
+A tool to convert PDF files to Markdown (`.md`), with automatic image extraction and inline citation. Available as both a CLI and a web app.
+
+![pdf2md web interface](Assets/home.png)
 
 ## Features
 
@@ -15,6 +17,7 @@ A simple CLI tool to convert PDF files to Markdown (`.md`), with automatic image
 
 - Python 3.10+
 - [PyMuPDF](https://pymupdf.readthedocs.io/) (`pymupdf`)
+- [Flask](https://flask.palletsprojects.com/) (`flask`) — for the web app only
 
 ## Installation
 
@@ -26,20 +29,22 @@ pip install -r requirements.txt
 
 ## Usage
 
+### CLI
+
 ```bash
 python pdf2md.py <input.pdf>
 ```
 
 The output `.md` file is written to the current directory with the same base name as the PDF.
 
-### Options
+#### Options
 
 | Flag | Description |
 |------|-------------|
 | `-o`, `--output` | Path for the output `.md` file (default: `<input>.md` in current dir) |
 | `--images-dir` | Subdirectory name for extracted images (default: `images`) |
 
-### Examples
+#### Examples
 
 ```bash
 # Basic conversion
@@ -51,6 +56,14 @@ python pdf2md.py report.pdf -o output/report.md
 # Custom images directory
 python pdf2md.py report.pdf --images-dir assets
 ```
+
+### Web App
+
+```bash
+python app.py
+```
+
+Then open `http://localhost:5000` in your browser. Upload a PDF and download a `.zip` containing the Markdown file and any extracted images.
 
 ## Output Structure
 
